@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,6 +25,17 @@ LLM_STUB = os.getenv("LLM_STUB", "0").lower() in {
     "true",
     "yes",
 }
+LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "30"))
+
+LLM_MAX_RETRIES = int(
+    os.getenv("LLM_MAX_RETRIES", "2")
+)
 
 PROMPT_VERSION = "v1"
 PROMPT_PATH = Path(__file__).parent / "prompts" / "v1.txt"
@@ -73,38 +85,88 @@ def get_llm_client() -> OpenAI:
     return OpenAI(
         api_key=LLM_API_KEY,
         base_url=LLM_BASE_URL,
-        timeout=30.0,
+        timeout=LLM_TIMEOUT,
         max_retries=0,
     )
 
+def is_retryable_error(error: Exception) -> bool:
+    message = str(error).lower()
 
-def call_llm(text: str, system_prompt: str | None = None) -> str:
-    prompt = system_prompt if system_prompt is not None else load_prompt()
-
-    client = get_llm_client()
-
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": prompt,
-            },
-            {
-                "role": "user",
-                "content": text,
-            },
-        ],
-        temperature=0,
+    retryable_terms = (
+        "timeout",
+        "timed out",
+        "connection",
+        "temporarily unavailable",
+        "rate limit",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
     )
 
-    content = response.choices[0].message.content
+    return any(
+        term in message
+        for term in retryable_terms
+    )
 
-    if not content:
-        raise ValueError("LLM returned an empty response")
 
-    return content
+def call_llm(
+    text: str,
+    system_prompt: str | None = None,
+) -> str:
 
+    prompt = (
+        system_prompt
+        if system_prompt is not None
+        else load_prompt()
+    )
+
+    last_error = None
+
+    for attempt in range(LLM_MAX_RETRIES + 1):
+
+        try:
+            client = get_llm_client()
+
+            response = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": text,
+                    },
+                ],
+                temperature=0,
+            )
+
+            content = response.choices[0].message.content
+
+            if not content:
+                raise ValueError(
+                    "LLM returned an empty response"
+                )
+
+            return content
+
+        except Exception as e:
+            last_error = e
+
+            if not is_retryable_error(e):
+                raise
+
+            if attempt >= LLM_MAX_RETRIES:
+                raise
+
+            time.sleep(1 * (attempt + 1))
+
+    raise RuntimeError(
+        f"LLM request failed: {last_error}"
+    )
 
 def clean_json(content: str) -> str:
     cleaned = content.strip()
@@ -205,6 +267,12 @@ def health():
 
 @app.post("/classify", response_model=ClassifyResponse)
 def classify(data: ClassifyRequest):
+    if not LLM_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM service is disabled",
+        )
+
     if LLM_STUB:
         return ClassifyResponse(
             category="other",
